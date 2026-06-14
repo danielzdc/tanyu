@@ -1,0 +1,939 @@
+#!/usr/bin/env bash
+# cc-skill-audit — Security scanner for Claude Code third-party skills
+#
+# Usage:
+#   cc-skill-audit /path/to/skill          # full scan, human-readable report
+#   cc-skill-audit /path/to/skill --json   # machine-readable JSON output
+#   cc-skill-audit /path/to/skill --fast   # quick scan for hook (exit code only)
+#
+# Exit codes (--fast mode):
+#   0 = GREEN (safe)
+#   1 = YELLOW (caution)
+#   2 = RED (suspicious)
+#   3 = error
+#
+# Dependencies: grep, find, awk, sed (standard POSIX)
+# Optional: jq (for --json output)
+
+set -uo pipefail
+
+VERSION="0.2.0"
+
+# ─── Args ────────────────────────────────────────────────────
+TARGET=""
+MODE="full"  # full | fast | json | sarif | diff
+DIFF_FILE=""
+
+for arg in "$@"; do
+  case "$arg" in
+    --fast)    MODE="fast" ;;
+    --json)    MODE="json" ;;
+    --sarif)   MODE="sarif" ;;
+    --diff=*)  MODE="diff"; DIFF_FILE="${arg#--diff=}" ;;
+    --history)
+      CONFIG_DIR="${CC_SKILL_AUDIT_CONFIG:-$HOME/.config/cc-skill-audit}"
+      HISTORY_DB="$CONFIG_DIR/scan-history.db"
+      if [ ! -f "$HISTORY_DB" ]; then
+        echo "No scan history found."
+        exit 0
+      fi
+      python3 -c "
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+rows = conn.execute('SELECT timestamp, skill, risk, score, reasons FROM scans ORDER BY timestamp DESC LIMIT 20').fetchall()
+if not rows:
+    print('No scan history.')
+else:
+    print(f'Last {len(rows)} scans:')
+    print(f'{\"Timestamp\":<20} {\"Skill\":<25} {\"Risk\":<8} {\"Score\":<6} Reasons')
+    print('-' * 90)
+    for ts, skill, risk, score, reasons in rows:
+        print(f'{ts:<20} {skill:<25} {risk:<8} {score:<6} {reasons[:40]}')
+conn.close()
+" "$HISTORY_DB"
+      exit 0
+      ;;
+    --version) echo "cc-skill-audit $VERSION"; exit 0 ;;
+    --help|-h)
+      echo "Usage: cc-skill-audit <skill-directory> [--fast|--json|--sarif|--diff=<prev.json>|--history|--version]"
+      exit 0
+      ;;
+    -*)
+      echo "Unknown option: $arg" >&2
+      exit 3
+      ;;
+    *)
+      [ -z "$TARGET" ] && TARGET="$arg"
+      ;;
+  esac
+done
+
+if [ -z "$TARGET" ]; then
+  echo "Error: no skill directory specified" >&2
+  echo "Usage: cc-skill-audit <skill-directory> [--fast|--json|--sarif|--diff=<prev.json>]" >&2
+  exit 3
+fi
+
+# ─── Allowlist / Blocklist ──────────────────────────────────
+CONFIG_DIR="${CC_SKILL_AUDIT_CONFIG:-$HOME/.config/cc-skill-audit}"
+ALLOWLIST_FILE="$CONFIG_DIR/allowlist.txt"
+BLOCKLIST_FILE="$CONFIG_DIR/blocklist.txt"
+
+check_lists() {
+  local name="$1"
+  # Check blocklist first (takes precedence)
+  if [ -f "$BLOCKLIST_FILE" ] && grep -qxF "$name" "$BLOCKLIST_FILE" 2>/dev/null; then
+    echo "blocked"
+    return
+  fi
+  # Check allowlist
+  if [ -f "$ALLOWLIST_FILE" ] && grep -qxF "$name" "$ALLOWLIST_FILE" 2>/dev/null; then
+    echo "allowed"
+    return
+  fi
+  echo "unknown"
+}
+
+# Resolve path
+TARGET="${TARGET/#\~/$HOME}"
+TARGET="${TARGET//\$HOME/$HOME}"
+TARGET="${TARGET//\$\{HOME\}/$HOME}"
+if [ "${TARGET#/}" = "$TARGET" ]; then
+  TARGET="$(pwd)/$TARGET"
+fi
+
+if [ ! -d "$TARGET" ]; then
+  echo "Error: not a directory: $TARGET" >&2
+  exit 3
+fi
+
+SKILL_NAME="$(basename "$TARGET")"
+
+# Check allowlist/blocklist before scanning
+LIST_STATUS=$(check_lists "$SKILL_NAME")
+if [ "$LIST_STATUS" = "blocked" ]; then
+  if [ "$MODE" = "fast" ]; then
+    exit 2
+  elif [ "$MODE" = "json" ]; then
+    python3 -c "
+import json, sys
+print(json.dumps({'skill': sys.argv[1], 'risk': 'RED', 'score': 100, 'recommendation': 'do-not-install', 'reasons': 'skill is on the blocklist', 'version': sys.argv[2]}, indent=2))
+" "$SKILL_NAME" "$VERSION"
+    exit 0
+  else
+    echo "## Skill Audit Report: $SKILL_NAME"
+    echo ""
+    echo "### Risk Level: RED (Score: 100/100)"
+    echo ""
+    echo "This skill is on the **blocklist**. Installation blocked."
+    exit 0
+  fi
+fi
+
+if [ "$LIST_STATUS" = "allowed" ] && [ "$MODE" = "fast" ]; then
+  exit 0  # Allowlisted skills pass fast mode immediately
+fi
+
+# ─── Inventory files ─────────────────────────────────────────
+FILES_TMP=$(mktemp /tmp/cc-skill-audit.files.XXXXXX 2>/dev/null)
+if [ -z "$FILES_TMP" ] || [ ! -f "$FILES_TMP" ]; then
+  echo "Error: failed to create temp file" >&2
+  exit 3
+fi
+trap 'rm -f "$FILES_TMP"' EXIT
+SCAN_ERRORS=0
+
+# Separately enumerate symlinks for reporting (they're excluded from the file list below)
+SYMLINK_HITS=$(find "$TARGET" \
+  \( -path '*/.git' -o -path '*/node_modules' -o -path '*/dist' -o -path '*/build' -o -path '*/coverage' \) -prune -o \
+  -type l -print 2>/dev/null | head -n 10)
+
+# Regular files, NUL-delimited to survive weird filenames
+find "$TARGET" \
+  \( -path '*/.git' -o -path '*/node_modules' -o -path '*/dist' -o -path '*/build' -o -path '*/coverage' \) -prune -o \
+  -type f -not -type l -print0 2>/dev/null > "${FILES_TMP}.nul"
+
+# Convert to newline-delimited, filtering out files whose names contain newline/CR
+# (such names are inherently suspicious and would break downstream grep pipelines).
+# Any filtered names are captured in $SUSPICIOUS_FILENAMES for reporting.
+SUSPICIOUS_FILENAMES=$(python3 - "${FILES_TMP}.nul" "$FILES_TMP" <<'PYEOF'
+import sys
+
+nul_path = sys.argv[1]
+out_path = sys.argv[2]
+suspicious = []
+with open(nul_path, "rb") as f:
+    data = f.read()
+with open(out_path, "w", encoding="utf-8", errors="replace") as w:
+    for chunk in data.split(b"\x00"):
+        if not chunk:
+            continue
+        try:
+            name = chunk.decode("utf-8")
+        except UnicodeDecodeError:
+            suspicious.append(repr(chunk))
+            continue
+        if "\n" in name or "\r" in name:
+            suspicious.append(repr(name))
+            continue
+        w.write(name + "\n")
+print("\n".join(suspicious))
+PYEOF
+)
+rm -f "${FILES_TMP}.nul"
+
+FILE_COUNT=$(wc -l < "$FILES_TMP" | tr -d ' ')
+if [ "$FILE_COUNT" -eq 0 ]; then
+  echo "Error: no files found in $TARGET" >&2
+  exit 3
+fi
+
+# Limit scan scope for --fast mode
+MAX_FILES=500
+if [ "$MODE" = "fast" ]; then
+  MAX_FILES=250
+fi
+if [ "$FILE_COUNT" -gt "$MAX_FILES" ]; then
+  head -n "$MAX_FILES" "$FILES_TMP" > "${FILES_TMP}.limited"
+  mv "${FILES_TMP}.limited" "$FILES_TMP"
+  TRUNCATED=true
+else
+  TRUNCATED=false
+fi
+
+# ─── Scan functions ──────────────────────────────────────────
+safe_grep() {
+  local pattern="$1"
+  local max_lines="${2:-50}"
+  local result
+  result=$(while IFS= read -r file; do
+    [ -f "$file" ] && grep -HnE "$pattern" -- "$file" 2>/dev/null || true
+  done < "$FILES_TMP" | head -n "$max_lines")
+  if [ $? -ne 0 ] && [ $? -ne 1 ]; then
+    SCAN_ERRORS=$((SCAN_ERRORS + 1))
+  fi
+  echo "$result"
+}
+
+# 1. Telemetry keywords
+TELEMETRY_PATTERN='telemetry|analytics|supabase|firebase|segment\.io|sentry|phone[._-]?home|beacon|metrics[._-]?(log|sync|send|upload|post)'
+TELEMETRY_HITS=$(safe_grep "$TELEMETRY_PATTERN" 30)
+
+# 2. Network calls
+NETWORK_PATTERN='https?://|curl[[:space:]]|wget[[:space:]]|fetch[[:space:]]*\(|axios([.(]|[[:space:]])|XMLHttpRequest|sendBeacon|WebSocket|\.post\(|\.put\('
+NETWORK_HITS=$(safe_grep "$NETWORK_PATTERN" 30)
+
+# 3. URL extraction (uses while-read to handle filenames with spaces/special chars)
+URLS=""
+if [ -n "$NETWORK_HITS" ]; then
+  URLS=$(while IFS= read -r file; do
+    [ -f "$file" ] && grep -hoE 'https?://[^"'"'"' )>]+' -- "$file" 2>/dev/null || true
+  done < "$FILES_TMP" \
+    | sed 's/[",)\].]*$//' \
+    | sort -u \
+    | head -n 30 || true)
+fi
+
+DOMAINS=""
+if [ -n "$URLS" ]; then
+  DOMAINS=$(echo "$URLS" | awk -F/ '{print $3}' | sed 's/:.*$//' | sort -u)
+fi
+
+# 4. Opt-in / consent signals
+OPTIN_PATTERN='opt[_-]?in|consent|enable[_-]?telemetry|disable[_-]?telemetry|telemetry[^[:alnum:]]*(false|off|disabled|none)|analytics[^[:alnum:]]*(false|off|disabled)'
+OPTIN_HITS=$(safe_grep "$OPTIN_PATTERN" 10)
+
+# 5. Dotfile / state directory creation (works on macOS + Linux)
+DOTFILE_PATTERN='(mkdir|touch|tee|cat|echo|printf|cp|mv|ln|writeFile|appendFile|fs\.write)[^#]*((\~|\$HOME|\$\{HOME\})/\.|/Users/[^/]+/\.|/home/[^/]+/\.)'
+DOTFILE_HITS=$(safe_grep "$DOTFILE_PATTERN" 20)
+
+# 6. Sensitive path access
+SENSITIVE_PATTERN='\.git/config|[~\$].*\.ssh|\.gnupg|\.env([[:space:]"'"'"'/:\.]|$)|id_rsa|id_ed25519|known_hosts|\.npmrc|\.pypirc|\.netrc'
+SENSITIVE_HITS=$(safe_grep "$SENSITIVE_PATTERN" 20)
+
+# 7. Hardcoded API keys / tokens
+KEY_PATTERN='ghp_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{20,}|sb_[A-Za-z0-9_-]{20,}|xox[bpsa]-[A-Za-z0-9-]+'
+KEY_HITS=$(safe_grep "$KEY_PATTERN" 10)
+
+# 8. Data fields that might be collected
+FIELD_PATTERN='repo|repository|branch|commit|diff|prompt|conversation|transcript|cwd|hostname|username|email|project|session[_-]?id'
+FIELD_HITS=$(safe_grep "$FIELD_PATTERN" 20)
+
+# 9. Obfuscation: base64 encoding
+BASE64_PATTERN='atob[[:space:]]*\(|btoa[[:space:]]*\(|Buffer\.from[[:space:]]*\([^)]*base64|b64decode|b64encode|base64[[:space:]]+(--)?-d|base64\.b64decode|base64\.decodebytes'
+BASE64_HITS=$(safe_grep "$BASE64_PATTERN" 20)
+
+# 10. Obfuscation: string concatenation to hide URLs/keywords
+CONCAT_PATTERN="['\"][a-z]{1,4}['\"][[:space:]]*\+[[:space:]]*['\"][a-z]{1,4}['\"][[:space:]]*\+[[:space:]]*['\"]"
+CONCAT_HITS=$(safe_grep "$CONCAT_PATTERN" 20)
+
+# 11. Obfuscation: hex/unicode escape sequences (suspicious density)
+HEX_PATTERN='(\\x[0-9a-fA-F]{2}){3,}|(\\u[0-9a-fA-F]{4}){3,}'
+HEX_HITS=$(safe_grep "$HEX_PATTERN" 20)
+
+# 12. Obfuscation: dynamic require/import
+DYN_REQUIRE_PATTERN='require[[:space:]]*\([[:space:]]*\[|require[[:space:]]*\([^)]*join|require[[:space:]]*\([^)]*\+|import[[:space:]]*\([^)]*\+|import[[:space:]]*\([^)]*join'
+DYN_REQUIRE_HITS=$(safe_grep "$DYN_REQUIRE_PATTERN" 20)
+
+# 13. Entropy analysis: detect long high-entropy strings (potential encoded payloads)
+ENTROPY_HITS=""
+if [ "$MODE" != "fast" ]; then
+  ENTROPY_SCRIPT_FILE=$(mktemp /tmp/cc-skill-audit.entropy.XXXXXX 2>/dev/null)
+  cat > "$ENTROPY_SCRIPT_FILE" << 'PYEOF'
+import math, sys, re
+with open(sys.argv[1], errors='ignore') as f:
+    for i, line in enumerate(f, 1):
+        for m in re.finditer(r'''['"]([  -~]{50,})['"]''', line):
+            s = m.group(1)
+            freq = {}
+            for c in s:
+                freq[c] = freq.get(c, 0) + 1
+            ent = -sum((v/len(s)) * math.log2(v/len(s)) for v in freq.values())
+            if ent > 4.8:
+                print(f'{sys.argv[1]}:{i}: high-entropy string (entropy={ent:.1f}, len={len(s)})')
+PYEOF
+  ENTROPY_HITS=$(while IFS= read -r file; do
+    [ -f "$file" ] && python3 "$ENTROPY_SCRIPT_FILE" "$file" 2>/dev/null || true
+  done < "$FILES_TMP" | head -n 20)
+  rm -f "$ENTROPY_SCRIPT_FILE"
+fi
+
+# 14. Dependency scanning (package.json / requirements.txt)
+DEP_HITS=""
+POSTINSTALL_HITS=""
+
+# Check for package.json with suspicious scripts
+PKG_JSON="$TARGET/package.json"
+if [ -f "$PKG_JSON" ]; then
+  POSTINSTALL_HITS=$(python3 -c "
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        pkg = json.load(f)
+    scripts = pkg.get('scripts', {})
+    suspicious = ['preinstall', 'postinstall', 'preuninstall', 'postuninstall']
+    for s in suspicious:
+        if s in scripts:
+            print(f'{sys.argv[1]}:scripts.{s}: {scripts[s]}')
+except Exception:
+    pass
+" "$PKG_JSON" 2>/dev/null)
+  # Count dependencies separately (not mixed into POSTINSTALL_HITS)
+  DEP_HITS=$(python3 -c "
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        pkg = json.load(f)
+    deps = {}
+    deps.update(pkg.get('dependencies', {}))
+    deps.update(pkg.get('devDependencies', {}))
+    if deps:
+        print(f'package.json: {len(deps)} packages')
+except Exception:
+    pass
+" "$PKG_JSON" 2>/dev/null)
+fi
+
+# Check for requirements.txt
+REQ_TXT="$TARGET/requirements.txt"
+if [ -f "$REQ_TXT" ]; then
+  dep_count=$(wc -l < "$REQ_TXT" | tr -d ' ')
+  DEP_HITS="requirements.txt: $dep_count packages"
+fi
+
+# Check for setup.py / pyproject.toml with install hooks
+SETUP_PY="$TARGET/setup.py"
+if [ -f "$SETUP_PY" ]; then
+  INSTALL_HOOK=$(grep -nE 'cmdclass|post_install|pre_install' "$SETUP_PY" 2>/dev/null || true)
+  [ -n "$INSTALL_HOOK" ] && POSTINSTALL_HITS="${POSTINSTALL_HITS:+$POSTINSTALL_HITS
+}$INSTALL_HOOK"
+fi
+
+# Scan node_modules postinstall scripts (shallow — top-level only)
+if [ -d "$TARGET/node_modules" ]; then
+  NODE_POSTINSTALL=$(find "$TARGET/node_modules" -maxdepth 2 -name "package.json" -exec \
+    python3 -c "
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        pkg = json.load(f)
+    name = pkg.get('name', 'unknown')
+    scripts = pkg.get('scripts', {})
+    for s in ['preinstall', 'postinstall']:
+        if s in scripts:
+            print(f'{name}: {s} = {scripts[s]}')
+except Exception:
+    pass
+" {} \; 2>/dev/null | head -n 20)
+  [ -n "$NODE_POSTINSTALL" ] && POSTINSTALL_HITS="${POSTINSTALL_HITS:+$POSTINSTALL_HITS
+}$NODE_POSTINSTALL"
+fi
+
+# 15. Binary / executable detection
+BINARY_HITS=""
+EXECUTABLE_HITS=""
+if command -v file >/dev/null 2>&1; then
+  BINARY_HITS=$(while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    ftype=$(file -b "$f" 2>/dev/null || true)
+    if echo "$ftype" | grep -qE 'ELF|Mach-O|PE32|WebAssembly|compiled Java'; then
+      echo "$f: $ftype"
+    fi
+  done < "$FILES_TMP" | head -n 20)
+fi
+
+# Find files with execute permission that aren't recognized scripts
+EXECUTABLE_HITS=""
+while IFS= read -r f; do
+  [ -f "$f" ] && [ -x "$f" ] || continue
+  # Skip known script types
+  case "$f" in
+    *.sh|*.bash|*.zsh|*.py|*.rb|*.pl|*.js|*.ts|*.mjs|*.md) continue ;;
+  esac
+  # Check if it has a shebang (script) or is binary
+  head_bytes=$(head -c 2 "$f" 2>/dev/null || true)
+  if [ "$head_bytes" != "#!" ]; then
+    EXECUTABLE_HITS="${EXECUTABLE_HITS:+$EXECUTABLE_HITS
+}$f"
+  fi
+done < "$FILES_TMP"
+# Trim to first 20
+if [ -n "$EXECUTABLE_HITS" ]; then
+  EXECUTABLE_HITS=$(echo "$EXECUTABLE_HITS" | head -n 20)
+fi
+
+# ─── Risk classification ─────────────────────────────────────
+RISK="GREEN"
+REASONS=""
+
+add_reason() {
+  if [ -z "$REASONS" ]; then
+    REASONS="$1"
+  else
+    REASONS="$REASONS; $1"
+  fi
+}
+
+# RED triggers
+if [ -n "$KEY_HITS" ]; then
+  RISK="RED"
+  add_reason "hardcoded API keys/tokens found"
+fi
+
+if [ -n "$SENSITIVE_HITS" ]; then
+  RISK="RED"
+  add_reason "reads sensitive paths (.ssh, .env, .gnupg)"
+fi
+
+if [ -n "$DOTFILE_HITS" ]; then
+  if [ "$RISK" != "RED" ]; then RISK="RED"; fi
+  add_reason "creates dotfiles/state outside skill directory"
+fi
+
+if [ -n "$TELEMETRY_HITS" ] && [ -n "$NETWORK_HITS" ] && [ -z "$OPTIN_HITS" ]; then
+  RISK="RED"
+  add_reason "telemetry + network calls without opt-in mechanism"
+fi
+
+if [ -n "$BINARY_HITS" ]; then
+  RISK="RED"
+  add_reason "compiled binary or executable blob detected"
+fi
+
+if [ -n "$SUSPICIOUS_FILENAMES" ]; then
+  RISK="RED"
+  add_reason "files with newline/control characters in names (likely scan evasion attempt)"
+fi
+
+if [ -n "$POSTINSTALL_HITS" ]; then
+  if [ -n "$NETWORK_HITS" ] || [ -n "$TELEMETRY_HITS" ]; then
+    RISK="RED"
+    add_reason "install lifecycle scripts combined with network/telemetry (likely install-time payload)"
+  elif [ "$RISK" != "RED" ]; then
+    RISK="YELLOW"
+    add_reason "install lifecycle scripts detected (preinstall/postinstall)"
+  fi
+fi
+
+if [ -n "$SYMLINK_HITS" ]; then
+  if [ "$RISK" = "GREEN" ]; then RISK="YELLOW"; fi
+  add_reason "contains symlinks (review targets before install)"
+fi
+
+if [ -n "$EXECUTABLE_HITS" ] && [ -z "$BINARY_HITS" ]; then
+  if [ "$RISK" = "GREEN" ]; then RISK="YELLOW"; fi
+  add_reason "non-script executable files found"
+fi
+
+# Obfuscation triggers (RED if combined with network/telemetry, YELLOW alone)
+OBFUSCATION_COUNT=0
+[ -n "$BASE64_HITS" ]      && OBFUSCATION_COUNT=$((OBFUSCATION_COUNT + 1))
+[ -n "$CONCAT_HITS" ]      && OBFUSCATION_COUNT=$((OBFUSCATION_COUNT + 1))
+[ -n "$HEX_HITS" ]         && OBFUSCATION_COUNT=$((OBFUSCATION_COUNT + 1))
+[ -n "$DYN_REQUIRE_HITS" ] && OBFUSCATION_COUNT=$((OBFUSCATION_COUNT + 1))
+[ -n "$ENTROPY_HITS" ]     && OBFUSCATION_COUNT=$((OBFUSCATION_COUNT + 1))
+
+if [ "$OBFUSCATION_COUNT" -ge 2 ]; then
+  RISK="RED"
+  add_reason "multiple obfuscation techniques detected (base64/concat/hex/dynamic-require/high-entropy)"
+elif [ "$OBFUSCATION_COUNT" -eq 1 ]; then
+  if [ -n "$NETWORK_HITS" ] || [ -n "$TELEMETRY_HITS" ]; then
+    RISK="RED"
+    add_reason "obfuscation combined with network/telemetry activity"
+  elif [ "$RISK" = "GREEN" ]; then
+    RISK="YELLOW"
+    add_reason "obfuscation technique detected (may be benign)"
+  fi
+fi
+
+# YELLOW triggers (only upgrade from GREEN)
+if [ "$RISK" = "GREEN" ]; then
+  if [ -n "$TELEMETRY_HITS" ] && [ -n "$OPTIN_HITS" ]; then
+    RISK="YELLOW"
+    add_reason "telemetry exists but appears opt-in"
+  elif [ -n "$TELEMETRY_HITS" ] && [ -z "$NETWORK_HITS" ]; then
+    RISK="YELLOW"
+    add_reason "telemetry keywords found but no outbound network calls"
+  elif [ -n "$NETWORK_HITS" ] && [ -z "$TELEMETRY_HITS" ]; then
+    RISK="YELLOW"
+    add_reason "network calls found (may be legitimate API usage)"
+  fi
+fi
+
+if [ "$RISK" = "GREEN" ] && [ "$TRUNCATED" = true ]; then
+  RISK="YELLOW"
+  add_reason "scan truncated ($MAX_FILES file limit) — manual review recommended"
+fi
+
+# Fail-safe: scan errors should never produce GREEN
+if [ "$RISK" = "GREEN" ] && [ "$SCAN_ERRORS" -gt 0 ]; then
+  RISK="YELLOW"
+  add_reason "scan completed with $SCAN_ERRORS error(s) — manual review recommended"
+fi
+
+[ -z "$REASONS" ] && REASONS="no suspicious patterns detected"
+
+# ─── Severity Score (0-100) ─────────────────────────────────
+SCORE=0
+[ -n "$TELEMETRY_HITS" ]  && SCORE=$((SCORE + 15))
+[ -n "$NETWORK_HITS" ]    && SCORE=$((SCORE + 15))
+[ -n "$KEY_HITS" ]        && SCORE=$((SCORE + 25))
+[ -n "$SENSITIVE_HITS" ]  && SCORE=$((SCORE + 20))
+[ -n "$DOTFILE_HITS" ]    && SCORE=$((SCORE + 15))
+[ -n "$FIELD_HITS" ]      && SCORE=$((SCORE + 5))
+[ "$TRUNCATED" = true ]   && SCORE=$((SCORE + 5))
+[ -n "$BASE64_HITS" ]     && SCORE=$((SCORE + 10))
+[ -n "$CONCAT_HITS" ]     && SCORE=$((SCORE + 10))
+[ -n "$HEX_HITS" ]        && SCORE=$((SCORE + 10))
+[ -n "$DYN_REQUIRE_HITS" ] && SCORE=$((SCORE + 10))
+[ -n "$ENTROPY_HITS" ]    && SCORE=$((SCORE + 5))
+[ -n "$BINARY_HITS" ]       && SCORE=$((SCORE + 20))
+[ -n "$EXECUTABLE_HITS" ]   && SCORE=$((SCORE + 10))
+[ -n "$POSTINSTALL_HITS" ]  && SCORE=$((SCORE + 15))
+# Reduce score if opt-in mechanism exists
+[ -n "$OPTIN_HITS" ] && [ "$SCORE" -gt 0 ] && SCORE=$((SCORE > 10 ? SCORE - 10 : 0))
+# Cap at 100
+[ "$SCORE" -gt 100 ] && SCORE=100
+
+# ─── Output ──────────────────────────────────────────────────
+
+# Map risk to recommendation
+case "$RISK" in
+  GREEN)  RECOMMENDATION="install" ;;
+  YELLOW) RECOMMENDATION="install-with-caution" ;;
+  RED)    RECOMMENDATION="do-not-install" ;;
+esac
+
+# Telemetry type inference
+TELEMETRY_FOUND="no"
+TELEMETRY_TYPE="none"
+TELEMETRY_OPTIN="n/a"
+TELEMETRY_BACKEND="none"
+
+if [ -n "$TELEMETRY_HITS" ]; then
+  TELEMETRY_FOUND="yes"
+  if [ -n "$NETWORK_HITS" ]; then
+    TELEMETRY_TYPE="remote-sync"
+  else
+    TELEMETRY_TYPE="local-only"
+  fi
+  if [ -n "$OPTIN_HITS" ]; then
+    TELEMETRY_OPTIN="yes"
+  else
+    TELEMETRY_OPTIN="no"
+  fi
+  if [ -n "$DOMAINS" ]; then
+    TELEMETRY_BACKEND=$(echo "$DOMAINS" | head -n 3 | tr '\n' ', ' | sed 's/,$//')
+  fi
+fi
+
+# Sensitive fields
+SENSITIVE_FIELDS="none"
+if [ -n "$FIELD_HITS" ]; then
+  SENSITIVE_FIELDS=$(echo "$FIELD_HITS" | grep -oE '(repo|repository|branch|commit|prompt|conversation|transcript|session[_-]?id|cwd|hostname|username|email|project)' | sort -u | tr '\n' ', ' | sed 's/,$//')
+  [ -z "$SENSITIVE_FIELDS" ] && SENSITIVE_FIELDS="none"
+fi
+
+# Dotfile list
+DOTFILE_PATHS="none"
+if [ -n "$DOTFILE_HITS" ]; then
+  DOTFILE_PATHS=$(echo "$DOTFILE_HITS" | grep -oE '(~/\.[^ "'"'"']+|\$HOME/\.[^ "'"'"']+|\$\{HOME\}/\.[^ "'"'"']+|/Users/[^/]+/\.[^ "'"'"']+|/home/[^/]+/\.[^ "'"'"']+)' | sort -u | head -n 10 | tr '\n' ', ' | sed 's/,$//')
+  [ -z "$DOTFILE_PATHS" ] && DOTFILE_PATHS="(detected but paths unclear)"
+fi
+
+# Sensitive reads
+SENSITIVE_READS="none"
+if [ -n "$SENSITIVE_HITS" ]; then
+  SENSITIVE_READS=$(echo "$SENSITIVE_HITS" | grep -oE '(\.git/config|\.ssh|\.gnupg|\.env|id_rsa|id_ed25519|known_hosts|\.npmrc|\.pypirc|\.netrc)' | sort -u | tr '\n' ', ' | sed 's/,$//')
+  [ -z "$SENSITIVE_READS" ] && SENSITIVE_READS="(detected but specifics unclear)"
+fi
+
+# Domain list
+DOMAIN_LIST="none"
+if [ -n "$DOMAINS" ]; then
+  DOMAIN_LIST=$(echo "$DOMAINS" | tr '\n' ', ' | sed 's/,$//')
+fi
+
+HAS_KEYS="no"
+[ -n "$KEY_HITS" ] && HAS_KEYS="yes"
+
+# ─── Record scan history ────────────────────────────────────
+HISTORY_DB="$CONFIG_DIR/scan-history.db"
+record_scan() {
+  [ -d "$CONFIG_DIR" ] || mkdir -p "$CONFIG_DIR"
+  python3 -c "
+import sqlite3, sys, os
+db_path = sys.argv[1]
+conn = sqlite3.connect(db_path)
+conn.execute('''CREATE TABLE IF NOT EXISTS scans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    skill TEXT NOT NULL,
+    risk TEXT NOT NULL,
+    score INTEGER NOT NULL,
+    reasons TEXT,
+    files_scanned INTEGER,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+)''')
+conn.execute('INSERT INTO scans (skill, risk, score, reasons, files_scanned) VALUES (?, ?, ?, ?, ?)',
+    (sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5], int(sys.argv[6])))
+conn.commit()
+conn.close()
+" "$HISTORY_DB" "$SKILL_NAME" "$RISK" "$SCORE" "$REASONS" "$FILE_COUNT" 2>/dev/null || true
+}
+
+# Record scan (unless in fast mode for performance)
+if [ "$MODE" != "fast" ]; then
+  record_scan
+fi
+
+# ─── Fast mode: exit code only ───────────────────────────────
+if [ "$MODE" = "fast" ]; then
+  case "$RISK" in
+    GREEN)  exit 0 ;;
+    YELLOW) exit 1 ;;
+    RED)    exit 2 ;;
+  esac
+fi
+
+# ─── JSON mode ───────────────────────────────────────────────
+if [ "$MODE" = "json" ]; then
+  python3 -c "
+import json, sys
+data = {
+    'skill': sys.argv[1],
+    'risk': sys.argv[2],
+    'score': int(sys.argv[3]),
+    'recommendation': sys.argv[4],
+    'reasons': sys.argv[5],
+    'telemetry': {
+        'found': sys.argv[6],
+        'type': sys.argv[7],
+        'opt_in': sys.argv[8],
+        'backend': sys.argv[9]
+    },
+    'network': {
+        'domains': sys.argv[10],
+        'hardcoded_keys': sys.argv[11]
+    },
+    'filesystem': {
+        'creates_dotfiles': sys.argv[12],
+        'reads_sensitive': sys.argv[13]
+    },
+    'obfuscation': {
+        'base64': sys.argv[14] != '',
+        'string_concat': sys.argv[15] != '',
+        'hex_unicode': sys.argv[16] != '',
+        'dynamic_require': sys.argv[17] != '',
+        'high_entropy': sys.argv[18] != '',
+        'techniques_found': int(sys.argv[19])
+    },
+    'binary': {
+        'compiled_binaries': sys.argv[20] != '',
+        'suspicious_executables': sys.argv[21] != ''
+    },
+    'data_fields': sys.argv[22],
+    'files_scanned': int(sys.argv[23]),
+    'truncated': sys.argv[24] == 'true',
+    'version': sys.argv[25]
+}
+print(json.dumps(data, indent=2, ensure_ascii=False))
+" \
+    "$SKILL_NAME" "$RISK" "$SCORE" "$RECOMMENDATION" "$REASONS" \
+    "$TELEMETRY_FOUND" "$TELEMETRY_TYPE" "$TELEMETRY_OPTIN" "$TELEMETRY_BACKEND" \
+    "$DOMAIN_LIST" "$HAS_KEYS" \
+    "$DOTFILE_PATHS" "$SENSITIVE_READS" \
+    "${BASE64_HITS:+y}" "${CONCAT_HITS:+y}" "${HEX_HITS:+y}" "${DYN_REQUIRE_HITS:+y}" "${ENTROPY_HITS:+y}" "$OBFUSCATION_COUNT" \
+    "${BINARY_HITS:+y}" "${EXECUTABLE_HITS:+y}" \
+    "$SENSITIVE_FIELDS" "$FILE_COUNT" "$TRUNCATED" "$VERSION"
+  exit 0
+fi
+
+# ─── SARIF mode ──────────────────────────────────────────────
+if [ "$MODE" = "sarif" ]; then
+  # Collect all hits into a temp file with rule metadata
+  SARIF_TMP=$(mktemp /tmp/cc-skill-audit.sarif.XXXXXX 2>/dev/null)
+
+  dump_hits() {
+    local rule_id="$1" level="$2" msg="$3" hits="$4"
+    while IFS= read -r hit; do
+      [ -z "$hit" ] && continue
+      printf '%s\t%s\t%s\t%s\n' "$rule_id" "$level" "$msg" "$hit"
+    done <<< "$hits"
+  }
+
+  {
+    [ -n "$KEY_HITS" ] && dump_hits "hardcoded-key" "error" "Hardcoded API key or token detected" "$KEY_HITS"
+    [ -n "$SENSITIVE_HITS" ] && dump_hits "sensitive-read" "error" "Reads sensitive file path" "$SENSITIVE_HITS"
+    [ -n "$DOTFILE_HITS" ] && dump_hits "dotfile-write" "error" "Creates dotfile or state directory outside skill folder" "$DOTFILE_HITS"
+    [ -n "$TELEMETRY_HITS" ] && [ -z "$OPTIN_HITS" ] && dump_hits "undisclosed-telemetry" "warning" "Telemetry without opt-in mechanism" "$TELEMETRY_HITS"
+    [ -n "$NETWORK_HITS" ] && [ -z "$TELEMETRY_HITS" ] && dump_hits "network-call" "note" "Outbound network call detected" "$NETWORK_HITS"
+    [ -n "$BASE64_HITS" ] && dump_hits "obfuscation-base64" "warning" "Base64 encoding/decoding detected" "$BASE64_HITS"
+    [ -n "$CONCAT_HITS" ] && dump_hits "obfuscation-concat" "warning" "String concatenation pattern (potential URL hiding)" "$CONCAT_HITS"
+    [ -n "$HEX_HITS" ] && dump_hits "obfuscation-hex" "warning" "Hex/Unicode escape sequences detected" "$HEX_HITS"
+    [ -n "$DYN_REQUIRE_HITS" ] && dump_hits "obfuscation-dynamic-require" "warning" "Dynamic require/import detected" "$DYN_REQUIRE_HITS"
+    [ -n "$ENTROPY_HITS" ] && dump_hits "obfuscation-entropy" "note" "High-entropy string detected (potential encoded payload)" "$ENTROPY_HITS"
+    [ -n "$BINARY_HITS" ] && dump_hits "binary-blob" "error" "Compiled binary or executable blob detected" "$BINARY_HITS"
+    [ -n "$EXECUTABLE_HITS" ] && dump_hits "suspicious-executable" "warning" "Non-script executable file detected" "$EXECUTABLE_HITS"
+  } > "$SARIF_TMP"
+
+  python3 -c "
+import json, sys
+
+target_prefix = sys.argv[1].rstrip('/') + '/'
+version = sys.argv[2]
+risk = sys.argv[3]
+score = int(sys.argv[4])
+hits_file = sys.argv[5]
+
+results = []
+with open(hits_file) as f:
+    for line in f:
+        line = line.rstrip('\n')
+        if not line:
+            continue
+        parts = line.split('\t', 3)
+        if len(parts) < 4:
+            continue
+        rule_id, level, msg, grep_line = parts
+        # Parse grep output: file:linenum:content
+        # Use regex to handle filenames containing colons
+        import re
+        m = re.match(r'^(.+?):(\d+):', grep_line)
+        if m:
+            fpath = m.group(1)
+            if fpath.startswith(target_prefix):
+                fpath = fpath[len(target_prefix):]
+            line_num = int(m.group(2))
+        else:
+            fpath = grep_line.split(':')[0] if ':' in grep_line else grep_line
+            if fpath.startswith(target_prefix):
+                fpath = fpath[len(target_prefix):]
+            line_num = 1
+        results.append({
+            'ruleId': rule_id,
+            'level': level,
+            'message': {'text': msg},
+            'locations': [{
+                'physicalLocation': {
+                    'artifactLocation': {'uri': fpath},
+                    'region': {'startLine': line_num}
+                }
+            }]
+        })
+
+sarif = {
+    '\$schema': 'https://docs.oasis-open.org/sarif/sarif/v2.1.0/errata01/os/schemas/sarif-schema-2.1.0.json',
+    'version': '2.1.0',
+    'runs': [{
+        'tool': {
+            'driver': {
+                'name': 'cc-skill-audit',
+                'version': version,
+                'informationUri': 'https://github.com/MakiDevelop/cc-skill-audit',
+                'rules': [
+                    {'id': 'hardcoded-key', 'shortDescription': {'text': 'Hardcoded API key or token'}, 'defaultConfiguration': {'level': 'error'}},
+                    {'id': 'sensitive-read', 'shortDescription': {'text': 'Reads sensitive file paths'}, 'defaultConfiguration': {'level': 'error'}},
+                    {'id': 'dotfile-write', 'shortDescription': {'text': 'Creates dotfiles outside skill dir'}, 'defaultConfiguration': {'level': 'error'}},
+                    {'id': 'undisclosed-telemetry', 'shortDescription': {'text': 'Telemetry without opt-in'}, 'defaultConfiguration': {'level': 'warning'}},
+                    {'id': 'network-call', 'shortDescription': {'text': 'Outbound network call'}, 'defaultConfiguration': {'level': 'note'}},
+                    {'id': 'obfuscation-base64', 'shortDescription': {'text': 'Base64 encoding/decoding'}, 'defaultConfiguration': {'level': 'warning'}},
+                    {'id': 'obfuscation-concat', 'shortDescription': {'text': 'String concatenation hiding'}, 'defaultConfiguration': {'level': 'warning'}},
+                    {'id': 'obfuscation-hex', 'shortDescription': {'text': 'Hex/Unicode escape sequences'}, 'defaultConfiguration': {'level': 'warning'}},
+                    {'id': 'obfuscation-dynamic-require', 'shortDescription': {'text': 'Dynamic require/import'}, 'defaultConfiguration': {'level': 'warning'}},
+                    {'id': 'obfuscation-entropy', 'shortDescription': {'text': 'High-entropy string'}, 'defaultConfiguration': {'level': 'note'}}
+                ]
+            }
+        },
+        'results': results,
+        'invocations': [{
+            'executionSuccessful': True,
+            'properties': {
+                'risk': risk,
+                'score': score
+            }
+        }]
+    }]
+}
+print(json.dumps(sarif, indent=2, ensure_ascii=False))
+" "$TARGET" "$VERSION" "$RISK" "$SCORE" "$SARIF_TMP"
+  rm -f "$SARIF_TMP"
+  exit 0
+fi
+
+# ─── Diff mode ───────────────────────────────────────────────
+if [ "$MODE" = "diff" ]; then
+  if [ ! -f "$DIFF_FILE" ]; then
+    echo "Error: previous scan file not found: $DIFF_FILE" >&2
+    exit 3
+  fi
+  # Generate current scan as JSON, then diff with previous
+  CURRENT_JSON=$(python3 -c "
+import json, sys
+data = {
+    'skill': sys.argv[1],
+    'risk': sys.argv[2],
+    'score': int(sys.argv[3]),
+    'recommendation': sys.argv[4],
+    'reasons': sys.argv[5],
+    'telemetry': {
+        'found': sys.argv[6],
+        'type': sys.argv[7],
+        'opt_in': sys.argv[8],
+        'backend': sys.argv[9]
+    },
+    'network': {
+        'domains': sys.argv[10],
+        'hardcoded_keys': sys.argv[11]
+    },
+    'filesystem': {
+        'creates_dotfiles': sys.argv[12],
+        'reads_sensitive': sys.argv[13]
+    },
+    'obfuscation': {
+        'base64': sys.argv[14] != '',
+        'string_concat': sys.argv[15] != '',
+        'hex_unicode': sys.argv[16] != '',
+        'dynamic_require': sys.argv[17] != '',
+        'high_entropy': sys.argv[18] != '',
+        'techniques_found': int(sys.argv[19])
+    },
+    'binary': {
+        'compiled_binaries': sys.argv[20] != '',
+        'suspicious_executables': sys.argv[21] != ''
+    },
+    'data_fields': sys.argv[22],
+    'files_scanned': int(sys.argv[23]),
+    'truncated': sys.argv[24] == 'true',
+    'version': sys.argv[25]
+}
+print(json.dumps(data))
+" \
+    "$SKILL_NAME" "$RISK" "$SCORE" "$RECOMMENDATION" "$REASONS" \
+    "$TELEMETRY_FOUND" "$TELEMETRY_TYPE" "$TELEMETRY_OPTIN" "$TELEMETRY_BACKEND" \
+    "$DOMAIN_LIST" "$HAS_KEYS" \
+    "$DOTFILE_PATHS" "$SENSITIVE_READS" \
+    "${BASE64_HITS:+y}" "${CONCAT_HITS:+y}" "${HEX_HITS:+y}" "${DYN_REQUIRE_HITS:+y}" "${ENTROPY_HITS:+y}" "$OBFUSCATION_COUNT" \
+    "${BINARY_HITS:+y}" "${EXECUTABLE_HITS:+y}" \
+    "$SENSITIVE_FIELDS" "$FILE_COUNT" "$TRUNCATED" "$VERSION")
+
+  python3 -c "
+import json, sys
+
+with open(sys.argv[1]) as f:
+    prev = json.load(f)
+curr = json.loads(sys.argv[2])
+
+changes = []
+def compare(path, old, new):
+    if isinstance(old, dict) and isinstance(new, dict):
+        for k in set(list(old.keys()) + list(new.keys())):
+            compare(f'{path}.{k}', old.get(k), new.get(k))
+    elif old != new:
+        changes.append({'field': path, 'previous': old, 'current': new})
+
+compare('', prev, curr)
+
+result = {
+    'skill': curr.get('skill', ''),
+    'previous_risk': prev.get('risk', 'UNKNOWN'),
+    'current_risk': curr.get('risk', 'UNKNOWN'),
+    'previous_score': prev.get('score', -1),
+    'current_score': curr.get('score', -1),
+    'risk_changed': prev.get('risk') != curr.get('risk'),
+    'score_delta': curr.get('score', 0) - prev.get('score', 0),
+    'changes': changes,
+    'summary': 'no changes' if not changes else f'{len(changes)} field(s) changed'
+}
+print(json.dumps(result, indent=2, ensure_ascii=False))
+" "$DIFF_FILE" "$CURRENT_JSON"
+  exit 0
+fi
+
+# ─── Full report ─────────────────────────────────────────────
+cat <<ENDREPORT
+## Skill Audit Report: $SKILL_NAME
+
+### Risk Level: $RISK (Score: $SCORE/100)
+
+### Telemetry
+- Found: $TELEMETRY_FOUND
+- Type: $TELEMETRY_TYPE
+- Opt-in: $TELEMETRY_OPTIN
+- Backend: $TELEMETRY_BACKEND
+
+### Data Collection
+- Fields: $SENSITIVE_FIELDS
+- Sensitive: $([ -n "$SENSITIVE_HITS" ] && echo "yes" || echo "none detected")
+
+### Network
+- Outbound domains: $DOMAIN_LIST
+- Hardcoded keys: $HAS_KEYS
+
+### File System
+- Creates dotfiles: $DOTFILE_PATHS
+- Reads sensitive paths: $SENSITIVE_READS
+
+### Obfuscation
+- Base64 encoding: $([ -n "$BASE64_HITS" ] && echo "yes" || echo "no")
+- String concatenation: $([ -n "$CONCAT_HITS" ] && echo "yes" || echo "no")
+- Hex/Unicode escapes: $([ -n "$HEX_HITS" ] && echo "yes" || echo "no")
+- Dynamic require/import: $([ -n "$DYN_REQUIRE_HITS" ] && echo "yes" || echo "no")
+- High-entropy strings: $([ -n "$ENTROPY_HITS" ] && echo "yes" || echo "no")
+- Techniques found: $OBFUSCATION_COUNT
+
+### Dependencies
+- Install scripts: $([ -n "$POSTINSTALL_HITS" ] && echo "yes (preinstall/postinstall detected)" || echo "none")
+- Packages: $([ -n "$DEP_HITS" ] && echo "$DEP_HITS" || echo "none")
+- Package files: $([ -f "$PKG_JSON" ] && echo "package.json" || echo "")$([ -f "$REQ_TXT" ] && echo " requirements.txt" || echo "")$([ ! -f "$PKG_JSON" ] && [ ! -f "$REQ_TXT" ] && echo "none" || echo "")
+
+### Binary & Executables
+- Compiled binaries: $([ -n "$BINARY_HITS" ] && echo "yes" || echo "none")
+- Suspicious executables: $([ -n "$EXECUTABLE_HITS" ] && echo "yes" || echo "none")
+
+### Recommendation
+$RECOMMENDATION
+
+---
+Scanned $FILE_COUNT files$([ "$TRUNCATED" = true ] && echo " (truncated at $MAX_FILES)") | cc-skill-audit v$VERSION
+Reasons: $REASONS
+ENDREPORT
